@@ -35,6 +35,7 @@ constexpr char DOUBLE_BUTTON_COMMAND[] = "double-btn";
 constexpr char OLED_READY_MESSAGE[] = "Button radio ready";
 constexpr char OLED_PACKET_STATUS_FORMAT[] = "%u byte packet %s";
 constexpr char OLED_TOTAL_SENT_FORMAT[] = "Total sent: %lu";
+constexpr char OLED_QUEUED_PACKETS_FORMAT[] = "Queued: %lu";
 constexpr char OLED_TO_SLEEP_FORMAT[] = "To sleep: %lu s";
 constexpr char OLED_LAST_TRANSMISSION_TIME_FORMAT[] = "Last TX: %lu ms";
 constexpr char OLED_READY_TO_SEND_MESSAGE[] = "Ready to send";
@@ -45,6 +46,8 @@ constexpr char OLED_STATUS_READY[] = "ready";
 constexpr char OLED_STATUS_SENDING[] = "sending...";
 constexpr char OLED_STATUS_SENT[] = "sent";
 constexpr char OLED_STATUS_FAILED[] = "failed";
+constexpr char SERIAL_COMMAND_TO_TX_FORMAT[] =
+  "Radio task: command-to-TX delay=%lu ms\n";
 
 // Якщо друге натискання відбулося до цього порогу, формується double-btn;
 // після порогу натискання вважаються двома окремими single-btn.
@@ -62,6 +65,16 @@ enum class ButtonPress : uint8_t {
 struct RadioPacket {
   ButtonPress type;
   char text[RADIO_PACKET_SIZE - sizeof(ButtonPress)];
+};
+
+struct ButtonEvent {
+  ButtonPress press;
+  uint32_t receivedAtMs;
+};
+
+struct QueuedRadioPacket {
+  RadioPacket packet;
+  uint32_t queuedAtMs;
 };
 
 static_assert(sizeof(RadioPacket) == RADIO_PACKET_SIZE,
@@ -91,6 +104,13 @@ uint32_t getTimeToSleepMs() {
   return DEVICE_IDLE_SLEEP_MS - idleTimeMs;
 }
 
+uint32_t getPendingPacketCount() {
+  if (buttonQueue == nullptr || radioQueue == nullptr) {
+    return 0;
+  }
+  return uxQueueMessagesWaiting(buttonQueue) + uxQueueMessagesWaiting(radioQueue);
+}
+
 void showRadioStatus(size_t packetSize, const char *status, uint32_t elapsedMs = 0) {
   display.clearDisplay();
   display.setTextSize(1);
@@ -104,6 +124,10 @@ void showRadioStatus(size_t packetSize, const char *status, uint32_t elapsedMs =
 
   display.setCursor(0, 16);
   display.printf(OLED_TOTAL_SENT_FORMAT, static_cast<unsigned long>(sentPacketCount));
+
+  display.setCursor(0, 24);
+  display.printf(OLED_QUEUED_PACKETS_FORMAT,
+                 static_cast<unsigned long>(getPendingPacketCount()));
 
   display.setCursor(0, 32);
   display.printf(OLED_TO_SLEEP_FORMAT,
@@ -133,9 +157,12 @@ void showDutyCycleCountdown(uint32_t remainingMs) {
   display.setCursor(0, 16);
   display.printf(OLED_TOTAL_SENT_FORMAT, static_cast<unsigned long>(sentPacketCount));
   display.setCursor(0, 24);
+  display.printf(OLED_QUEUED_PACKETS_FORMAT,
+                 static_cast<unsigned long>(getPendingPacketCount()));
+  display.setCursor(0, 32);
   display.printf(OLED_TO_SLEEP_FORMAT,
                  static_cast<unsigned long>(getTimeToSleepMs() / 1000));
-  display.setCursor(0, 32);
+  display.setCursor(0, 40);
   display.printf(OLED_LAST_TRANSMISSION_TIME_FORMAT,
                  static_cast<unsigned long>(lastTransmissionTimeMs));
   display.setCursor(0, 52);
@@ -206,7 +233,8 @@ void buttonTask(void *parameter) {
           }
         }
 
-        xQueueSend(buttonQueue, &press, portMAX_DELAY);
+        ButtonEvent event{press, millis()};
+        xQueueSend(buttonQueue, &event, portMAX_DELAY);
       }
     }
 
@@ -230,9 +258,9 @@ void radioTask(void *parameter) {
     Serial.printf("Radio task: init failed, code %d\n", status);
   }
 
-  RadioPacket packet;
+  QueuedRadioPacket queuedPacket;
   for (;;) {
-    if (xQueueReceive(radioQueue, &packet, portMAX_DELAY) != pdTRUE) {
+    if (xQueueReceive(radioQueue, &queuedPacket, portMAX_DELAY) != pdTRUE) {
       continue;
     }
 
@@ -241,14 +269,15 @@ void radioTask(void *parameter) {
       continue;
     }
 
-    size_t packetSize = packet.type == ButtonPress::Single
+    size_t packetSize = queuedPacket.packet.type == ButtonPress::Single
         ? SINGLE_RADIO_PACKET_SIZE
         : RADIO_PACKET_SIZE;
     uint32_t transmissionStart = millis();
     int16_t sendStatus = radio.transmit(
-      reinterpret_cast<const uint8_t *>(&packet),
+      reinterpret_cast<const uint8_t *>(&queuedPacket.packet),
         packetSize);
     uint32_t transmissionTime = millis() - transmissionStart;
+    uint32_t commandToTxDelay = transmissionStart - queuedPacket.queuedAtMs;
     lastTransmissionTimeMs = transmissionTime;
     if (sendStatus == RADIOLIB_ERR_NONE) {
       ++sentPacketCount;
@@ -258,17 +287,18 @@ void radioTask(void *parameter) {
             sendStatus == RADIOLIB_ERR_NONE ? OLED_STATUS_SENT : OLED_STATUS_FAILED,
                     transmissionTime);
     Serial.printf("Radio task: sent \"%s\", size=%d bytes, result=%d\n",
-            packet.text,
+          queuedPacket.packet.text,
             packetSize,
             sendStatus);
+        Serial.printf(SERIAL_COMMAND_TO_TX_FORMAT,
+          static_cast<unsigned long>(commandToTxDelay));
 
     // Для duty cycle 1% пауза становить 99 тривалостей попередньої передачі.
     uint32_t quietTimeMs = transmissionTime *
         (100 - LORA_DUTY_CYCLE_PERCENT) / LORA_DUTY_CYCLE_PERCENT;
     if (quietTimeMs > 0) {
       dutyCycleWaiting = true;
-      Serial.printf("Radio task: duty-cycle wait %lu ms\n",
-                    static_cast<unsigned long>(quietTimeMs));
+      Serial.println(F("Radio task: waiting for duty cycle"));
       uint32_t waitStart = millis();
       uint32_t nextStatusUpdate = waitStart;
       uint32_t waitEnd = waitStart + quietTimeMs;
@@ -277,8 +307,6 @@ void radioTask(void *parameter) {
         uint32_t remainingMs = waitEnd - millis();
         if (static_cast<int32_t>(millis() - nextStatusUpdate) >= 0) {
           showDutyCycleCountdown(remainingMs);
-          Serial.printf("Radio task: next TX in %lu ms\n",
-                        static_cast<unsigned long>(remainingMs));
           nextStatusUpdate = millis() + 250;
         }
         vTaskDelay(pdMS_TO_TICKS(20));
@@ -303,8 +331,8 @@ void setup() {
                 SINGLE_BUTTON_COMMAND, DOUBLE_BUTTON_COMMAND);
 
   pinMode(LORA_BUTTON_PIN, INPUT_PULLUP);
-  buttonQueue = xQueueCreate(5, sizeof(ButtonPress));
-  radioQueue = xQueueCreate(5, sizeof(RadioPacket));
+  buttonQueue = xQueueCreate(5, sizeof(ButtonEvent));
+  radioQueue = xQueueCreate(5, sizeof(QueuedRadioPacket));
 
   if (buttonQueue == nullptr || radioQueue == nullptr) {
     Serial.println(F("Queue creation failed"));
@@ -341,12 +369,12 @@ void processSerialCommands() {
       unsigned long requestedWindowMs = 0;
 
       if (strcmp(command, SINGLE_BUTTON_COMMAND) == 0) {
-        ButtonPress press = ButtonPress::Single;
-        xQueueSend(buttonQueue, &press, 0);
+        ButtonEvent event{ButtonPress::Single, millis()};
+        xQueueSend(buttonQueue, &event, 0);
         Serial.println(F("Serial: simulated single press"));
       } else if (strcmp(command, DOUBLE_BUTTON_COMMAND) == 0) {
-        ButtonPress press = ButtonPress::Double;
-        xQueueSend(buttonQueue, &press, 0);
+        ButtonEvent event{ButtonPress::Double, millis()};
+        xQueueSend(buttonQueue, &event, 0);
         Serial.println(F("Serial: simulated double press"));
       } else if (strncmp(command, DOUBLE_BUTTON_COMMAND,
                          strlen(DOUBLE_BUTTON_COMMAND)) == 0 &&
@@ -355,14 +383,14 @@ void processSerialCommands() {
                         "%lu", &requestedWindowMs) == 1) {
         if (requestedWindowMs >= 100 && requestedWindowMs <= 2000) {
           if (requestedWindowMs > doubleClickWindowMs) {
-            ButtonPress singlePress = ButtonPress::Single;
-            xQueueSend(buttonQueue, &singlePress, 0);
-            xQueueSend(buttonQueue, &singlePress, 0);
+            ButtonEvent singleEvent{ButtonPress::Single, millis()};
+            xQueueSend(buttonQueue, &singleEvent, 0);
+            xQueueSend(buttonQueue, &singleEvent, 0);
             Serial.printf("Serial: %lu ms > %lu ms, queued two single presses\n",
                           requestedWindowMs, doubleClickWindowMs);
           } else {
-            ButtonPress doublePress = ButtonPress::Double;
-            xQueueSend(buttonQueue, &doublePress, 0);
+            ButtonEvent doubleEvent{ButtonPress::Double, millis()};
+            xQueueSend(buttonQueue, &doubleEvent, 0);
             Serial.printf("Serial: %lu ms <= %lu ms, queued one double press\n",
                           requestedWindowMs, doubleClickWindowMs);
           }
@@ -402,23 +430,24 @@ void loop() {
     lastWorkingDisplayMs = millis();
   }
 
-  ButtonPress press;
-  if (xQueueReceive(buttonQueue, &press, pdMS_TO_TICKS(20)) != pdTRUE) {
+  ButtonEvent event;
+  if (xQueueReceive(buttonQueue, &event, pdMS_TO_TICKS(20)) != pdTRUE) {
     return;
   }
 
   RadioPacket packet{};
-  packet.type = press;
-  const char *message = press == ButtonPress::Single
+  packet.type = event.press;
+  const char *message = event.press == ButtonPress::Single
       ? "BUTTON SINGLE"
       : "BUTTON DOUBLE";
   strncpy(packet.text, message, sizeof(packet.text) - 1);
   packet.text[sizeof(packet.text) - 1] = '\0';
 
-  size_t packetSize = press == ButtonPress::Single
+    QueuedRadioPacket queuedPacket{packet, event.receivedAtMs};
+    size_t packetSize = event.press == ButtonPress::Single
       ? SINGLE_RADIO_PACKET_SIZE
       : RADIO_PACKET_SIZE;
-  showRadioStatus(packetSize, OLED_STATUS_SENDING);
   Serial.printf("Main loop: %s\n", packet.text);
-  xQueueSend(radioQueue, &packet, portMAX_DELAY);
+  xQueueSend(radioQueue, &queuedPacket, portMAX_DELAY);
+  showRadioStatus(packetSize, OLED_STATUS_SENDING);
 }
