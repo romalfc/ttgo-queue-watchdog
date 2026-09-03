@@ -28,16 +28,15 @@
 // Після цього часу без успішної передачі пристрій переходить у light sleep.
 #define DEVICE_IDLE_SLEEP_MS 60000
 
-constexpr char SINGLE_BUTTON_COMMAND[] = "singleBtn";
-constexpr char DOUBLE_BUTTON_COMMAND[] = "doubleBtn";
+constexpr char SINGLE_BUTTON_COMMAND[] = "single-btn";
+constexpr char DOUBLE_BUTTON_COMMAND[] = "double-btn";
 
 // OLED-повідомлення та формати рядків зберігаються в одному місці.
 constexpr char OLED_READY_MESSAGE[] = "Button radio ready";
 constexpr char OLED_PACKET_STATUS_FORMAT[] = "%u byte packet %s";
 constexpr char OLED_TOTAL_SENT_FORMAT[] = "Total sent: %lu";
-constexpr char OLED_LAST_SLEEP_FORMAT[] = "Last sleep: %lu s";
 constexpr char OLED_TO_SLEEP_FORMAT[] = "To sleep: %lu s";
-constexpr char OLED_TRANSMISSION_TIME_FORMAT[] = "Time: %lu ms";
+constexpr char OLED_LAST_TRANSMISSION_TIME_FORMAT[] = "Last TX: %lu ms";
 constexpr char OLED_READY_TO_SEND_MESSAGE[] = "Ready to send";
 constexpr char OLED_DUTY_CYCLE_WAIT_MESSAGE[] = "Duty cycle wait";
 constexpr char OLED_NEXT_TX_FORMAT[] = "Next TX in: %lu ms";
@@ -47,8 +46,8 @@ constexpr char OLED_STATUS_SENDING[] = "sending...";
 constexpr char OLED_STATUS_SENT[] = "sent";
 constexpr char OLED_STATUS_FAILED[] = "failed";
 
-// Якщо друге натискання відбулося до цього порогу, формується doubleBtn;
-// після порогу натискання вважаються двома окремими singleBtn.
+// Якщо друге натискання відбулося до цього порогу, формується double-btn;
+// після порогу натискання вважаються двома окремими single-btn.
 #define DOUBLE_CLICK_THRESHOLD_MS 350
 
 // Час debounce сталий, а поріг подвійного натискання можна змінити через Serial.
@@ -78,7 +77,7 @@ QueueHandle_t buttonQueue;
 QueueHandle_t radioQueue;
 uint32_t sentPacketCount = 0;
 uint32_t lastSuccessfulPacketMs = 0;
-uint32_t wakeTimeMs = 0;
+uint32_t lastTransmissionTimeMs = 0;
 uint32_t lastWorkingDisplayMs = 0;
 bool displayReady = false;
 volatile bool dutyCycleWaiting = false;
@@ -106,18 +105,16 @@ void showRadioStatus(size_t packetSize, const char *status, uint32_t elapsedMs =
   display.setCursor(0, 16);
   display.printf(OLED_TOTAL_SENT_FORMAT, static_cast<unsigned long>(sentPacketCount));
 
-  display.setCursor(0, 24);
-  display.printf(OLED_LAST_SLEEP_FORMAT,
-                static_cast<unsigned long>((millis() - wakeTimeMs) / 1000));
-
-  display.setCursor(0, 36);
+  display.setCursor(0, 32);
   display.printf(OLED_TO_SLEEP_FORMAT,
                 static_cast<unsigned long>(getTimeToSleepMs() / 1000));
 
-  if (elapsedMs > 0) {
-    display.setCursor(0, 48);
-    display.printf(OLED_TRANSMISSION_TIME_FORMAT, static_cast<unsigned long>(elapsedMs));
-  }
+  display.setCursor(0, 48);
+  uint32_t displayedTransmissionTimeMs = elapsedMs > 0
+      ? elapsedMs
+      : lastTransmissionTimeMs;
+  display.printf(OLED_LAST_TRANSMISSION_TIME_FORMAT,
+                 static_cast<unsigned long>(displayedTransmissionTimeMs));
 
   display.display();
 }
@@ -134,22 +131,22 @@ void showDutyCycleCountdown(uint32_t remainingMs) {
     display.println(OLED_DUTY_CYCLE_WAIT_MESSAGE);
   }
   display.setCursor(0, 16);
-  display.printf(OLED_NEXT_TX_FORMAT, static_cast<unsigned long>(remainingMs));
-  display.setCursor(0, 32);
   display.printf(OLED_TOTAL_SENT_FORMAT, static_cast<unsigned long>(sentPacketCount));
-  display.setCursor(0, 40);
-  display.printf(OLED_LAST_SLEEP_FORMAT,
-                static_cast<unsigned long>((millis() - wakeTimeMs) / 1000));
-  display.setCursor(0, 52);
+  display.setCursor(0, 24);
   display.printf(OLED_TO_SLEEP_FORMAT,
-                static_cast<unsigned long>(getTimeToSleepMs() / 1000));
+                 static_cast<unsigned long>(getTimeToSleepMs() / 1000));
+  display.setCursor(0, 32);
+  display.printf(OLED_LAST_TRANSMISSION_TIME_FORMAT,
+                 static_cast<unsigned long>(lastTransmissionTimeMs));
+  display.setCursor(0, 52);
+  display.printf(OLED_NEXT_TX_FORMAT, static_cast<unsigned long>(remainingMs));
   display.display();
 }
 
 // Переводити ESP32 у light sleep. UART0 пробуджує пристрій першим байтом команди.
 void enterIdleSleep() {
   Serial.println(F("No packets for 60 seconds, entering light sleep."));
-  Serial.println(F("Send singleBtn or doubleBtn to wake the device."));
+  Serial.println(F("Send single-btn or double-btn to wake the device."));
 
   if (displayReady) {
     display.clearDisplay();
@@ -167,9 +164,8 @@ void enterIdleSleep() {
   uart_set_wakeup_threshold(UART_NUM_0, 3);
   esp_light_sleep_start();
 
-  wakeTimeMs = millis();
-  lastSuccessfulPacketMs = wakeTimeMs;
-  lastWorkingDisplayMs = wakeTimeMs;
+  lastSuccessfulPacketMs = millis();
+  lastWorkingDisplayMs = lastSuccessfulPacketMs;
   Serial.println(F("Device woke up from light sleep."));
   if (displayReady) {
     showRadioStatus(0, OLED_STATUS_READY);
@@ -253,6 +249,7 @@ void radioTask(void *parameter) {
       reinterpret_cast<const uint8_t *>(&packet),
         packetSize);
     uint32_t transmissionTime = millis() - transmissionStart;
+    lastTransmissionTimeMs = transmissionTime;
     if (sendStatus == RADIOLIB_ERR_NONE) {
       ++sentPacketCount;
       lastSuccessfulPacketMs = millis();
@@ -298,11 +295,10 @@ void radioTask(void *parameter) {
 void setup() {
   Serial.begin(115200);
   delay(500);
-  wakeTimeMs = millis();
-  lastSuccessfulPacketMs = wakeTimeMs;
+  lastSuccessfulPacketMs = millis();
   Serial.println(F("Button -> Queue -> Main Loop -> Radio Task"));
-  // Приклади: singleBtn; doubleBtn; doubleBtn 1000, потім Enter.
-  // doubleBtn без аргументу імітує double, а аргумент задає інтервал між натисканнями.
+  // Приклади: single-btn; double-btn; double-btn 1000, потім Enter.
+  // double-btn без аргументу імітує double, а аргумент задає інтервал між натисканнями.
   Serial.printf("Serial commands: %s, %s [100..2000]\n",
                 SINGLE_BUTTON_COMMAND, DOUBLE_BUTTON_COMMAND);
 
