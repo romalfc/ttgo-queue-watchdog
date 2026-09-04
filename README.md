@@ -33,6 +33,16 @@ Command: single-btn; cursor blink interval: 500 ms
 
 Команда `deadlock` запускає `DeadlockTask`, яка захоплює `displayMutex` і навмисно не звільняє його. Після цього `CursorTask` та головний цикл блокуються на цьому mutex. Для відновлення роботи потрібен reset плати.
 
+## Watchdog
+
+`WatchdogTask` перевіряє heartbeat `CursorTask` кожну секунду. Якщо heartbeat не оновлюється протягом 5 секунд, watchdog:
+
+- записує причину, uptime події, час останнього heartbeat, вільну heap-пам'ять, core та reset reason у RTC-пам'ять;
+- виводить короткий лог інциденту;
+- перезавантажує ESP32 через `esp_restart()`.
+
+Після перезапуску збережений звіт друкується в Serial Monitor. Для перевірки введіть `deadlock`; очікуваний перезапуск відбудеться приблизно через 5--6 секунд.
+
 ## Апаратна конфігурація
 
 | Пристрій | Параметр | GPIO |

@@ -2,6 +2,7 @@
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
+#include <esp_system.h>
 
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
@@ -14,6 +15,8 @@ constexpr char SINGLE_BUTTON_COMMAND[] = "single-btn";
 constexpr char DOUBLE_BUTTON_COMMAND[] = "double-btn";
 constexpr char DEADLOCK_COMMAND[] = "deadlock";
 constexpr uint32_t DOUBLE_CLICK_THRESHOLD_MS = 350;
+constexpr uint32_t WATCHDOG_TIMEOUT_MS = 5000;
+constexpr uint32_t WATCHDOG_INCIDENT_MAGIC = 0x57444331;
 
 constexpr uint32_t BLINK_INTERVALS_MS[] = {250, 500, 1000, 2000};
 constexpr size_t BLINK_INTERVAL_COUNT = sizeof(BLINK_INTERVALS_MS) /
@@ -38,11 +41,45 @@ struct SerialCommandResult {
   uint32_t intervalMs;
 };
 
+struct WatchdogIncident {
+  uint32_t magic;
+  uint32_t eventUptimeMs;
+  uint32_t lastCursorHeartbeatMs;
+  uint32_t freeHeap;
+  uint32_t minimumFreeHeap;
+  uint32_t resetReason;
+  uint32_t watchdogCore;
+  char reason[48];
+};
+
 QueueHandle_t buttonEventQueue;
 QueueHandle_t blinkIntervalQueue;
 QueueHandle_t serialResultQueue;
 QueueHandle_t deadlockQueue;
 SemaphoreHandle_t displayMutex;
+volatile uint32_t cursorHeartbeatMs = 0;
+RTC_DATA_ATTR WatchdogIncident lastWatchdogIncident{};
+
+void printPreviousWatchdogIncident() {
+  if (lastWatchdogIncident.magic != WATCHDOG_INCIDENT_MAGIC) {
+    return;
+  }
+
+  Serial.println(F("Previous watchdog incident:"));
+  Serial.printf("  reason=%s\n", lastWatchdogIncident.reason);
+  Serial.printf("  event_uptime_ms=%lu\n",
+                static_cast<unsigned long>(lastWatchdogIncident.eventUptimeMs));
+  Serial.printf("  last_cursor_heartbeat_ms=%lu\n",
+                static_cast<unsigned long>(lastWatchdogIncident.lastCursorHeartbeatMs));
+  Serial.printf("  free_heap=%lu, minimum_free_heap=%lu\n",
+                static_cast<unsigned long>(lastWatchdogIncident.freeHeap),
+                static_cast<unsigned long>(lastWatchdogIncident.minimumFreeHeap));
+  Serial.printf("  reset_reason_before_restart=%lu, watchdog_core=%lu\n",
+                static_cast<unsigned long>(lastWatchdogIncident.resetReason),
+                static_cast<unsigned long>(lastWatchdogIncident.watchdogCore));
+
+  lastWatchdogIncident.magic = 0;
+}
 
 void applyButtonPress(ButtonPress press, size_t &intervalIndex) {
   if (press == ButtonPress::Double) {
@@ -123,6 +160,7 @@ void cursorTask(void *parameter) {
     if (xQueueReceive(blinkIntervalQueue, &requestedIntervalMs,
                       pdMS_TO_TICKS(blinkIntervalMs)) == pdTRUE) {
       blinkIntervalMs = requestedIntervalMs;
+      cursorHeartbeatMs = millis();
       continue;
     }
 
@@ -132,6 +170,40 @@ void cursorTask(void *parameter) {
                      cursorVisible ? SSD1306_WHITE : SSD1306_BLACK);
     display.display();
     xSemaphoreGive(displayMutex);
+    cursorHeartbeatMs = millis();
+  }
+}
+
+void watchdogTask(void *parameter) {
+  (void)parameter;
+
+  for (;;) {
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    uint32_t nowMs = millis();
+    uint32_t lastHeartbeatMs = cursorHeartbeatMs;
+
+    if (nowMs - lastHeartbeatMs <= WATCHDOG_TIMEOUT_MS) {
+      continue;
+    }
+
+    lastWatchdogIncident.magic = WATCHDOG_INCIDENT_MAGIC;
+    lastWatchdogIncident.eventUptimeMs = nowMs;
+    lastWatchdogIncident.lastCursorHeartbeatMs = lastHeartbeatMs;
+    lastWatchdogIncident.freeHeap = ESP.getFreeHeap();
+    lastWatchdogIncident.minimumFreeHeap = ESP.getMinFreeHeap();
+    lastWatchdogIncident.resetReason = static_cast<uint32_t>(esp_reset_reason());
+    lastWatchdogIncident.watchdogCore = xPortGetCoreID();
+    strncpy(lastWatchdogIncident.reason,
+            "CursorTask heartbeat timeout; possible mutex deadlock",
+            sizeof(lastWatchdogIncident.reason) - 1);
+
+    Serial.println(F("WATCHDOG: CursorTask is not responding."));
+    Serial.printf("WATCHDOG: reboot in 100 ms, event_uptime_ms=%lu, last_heartbeat_ms=%lu\n",
+                  static_cast<unsigned long>(nowMs),
+                  static_cast<unsigned long>(lastHeartbeatMs));
+    Serial.flush();
+    vTaskDelay(pdMS_TO_TICKS(100));
+    esp_restart();
   }
 }
 
@@ -208,6 +280,8 @@ void processSerialCommands() {
 
 void setup() {
   Serial.begin(115200);
+  delay(100);
+  printPreviousWatchdogIncident();
   pinMode(BUTTON_PIN, INPUT_PULLUP);
 
   Wire.begin(OLED_SDA, OLED_SCL);
@@ -218,8 +292,8 @@ void setup() {
   buttonEventQueue = xQueueCreate(8, sizeof(SerialButtonCommand));
   blinkIntervalQueue = xQueueCreate(2, sizeof(uint32_t));
   serialResultQueue = xQueueCreate(8, sizeof(SerialCommandResult));
-    deadlockQueue = xQueueCreate(1, sizeof(bool));
-    displayMutex = xSemaphoreCreateMutex();
+  deadlockQueue = xQueueCreate(1, sizeof(bool));
+  displayMutex = xSemaphoreCreateMutex();
   if (buttonEventQueue == nullptr || blinkIntervalQueue == nullptr ||
       serialResultQueue == nullptr || deadlockQueue == nullptr ||
       displayMutex == nullptr) {
@@ -231,6 +305,8 @@ void setup() {
   xTaskCreatePinnedToCore(buttonTask, "ButtonTask", 2048, nullptr, 1, nullptr, 1);
   xTaskCreatePinnedToCore(cursorTask, "CursorTask", 2048, nullptr, 1, nullptr, 0);
   xTaskCreatePinnedToCore(deadlockTask, "DeadlockTask", 2048, nullptr, 1, nullptr, 0);
+  cursorHeartbeatMs = millis();
+  xTaskCreatePinnedToCore(watchdogTask, "WatchdogTask", 3072, nullptr, 2, nullptr, 1);
 }
 
 void loop() {
