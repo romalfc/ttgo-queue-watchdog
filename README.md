@@ -2,6 +2,8 @@
 
 Проєкт для ESP32 TTGO LoRa32 демонструє взаємодію двох FreeRTOS-задач через queue.
 
+Повна специфікація telemetry-протоколу: [PROTOCOL_SPEC.md](PROTOCOL_SPEC.md).
+
 ```text
 Кнопка -> ButtonTask (core 1) -> blinkIntervalQueue -> CursorTask (core 0) -> OLED
 Serial `radio` -> radioTransmitQueue -> RadioTask (core 0) -> SX1276
@@ -16,6 +18,8 @@ Serial `radio` -> radioTransmitQueue -> RadioTask (core 0) -> SX1276
 - Новий інтервал передається до `CursorTask` тільки через `blinkIntervalQueue`.
 - `CursorTask` блимає курсором у правому нижньому куті OLED.
 - `RadioTask` асинхронно передає 32-байтовий LoRa-пакет, не блокуючи `CursorTask`.
+- Під час запуску POST окремо перевіряє живлення, NVS, OLED і радіомодуль.
+- Результат POST зберігається як бітова маска і входить у перші 4 байти LoRa telemetry-пакета.
 
 ## Емуляція кнопки через Serial Monitor
 
@@ -97,6 +101,19 @@ config get
 - перезавантажує ESP32 через `esp_restart()`.
 
 Після перезапуску збережений звіт друкується в Serial Monitor. Для перевірки введіть `deadlock`; очікуваний перезапуск відбудеться приблизно через 5--6 секунд.
+
+## POST
+
+POST виконується до запуску FreeRTOS-задач. Біти маски:
+
+| Біт | Блок |
+| --- | --- |
+| `0x01` | живлення та базовий стан ESP32 |
+| `0x02` | NVS |
+| `0x04` | OLED |
+| `0x08` | LoRa SX1276 |
+
+Успішний результат: `0x0F`. Маска записується в ring log і telemetry-пакет команди `radio`.
 
 ## Апаратна конфігурація
 
