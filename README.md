@@ -3,6 +3,7 @@
 Проєкт для ESP32 TTGO LoRa32 демонструє взаємодію двох FreeRTOS-задач через queue.
 
 Повна специфікація telemetry-протоколу: [PROTOCOL_SPEC.md](PROTOCOL_SPEC.md).
+Польовий чекліст перед використанням: [FIELD_CHECKLIST.md](FIELD_CHECKLIST.md).
 
 ```text
 Кнопка -> ButtonTask (core 1) -> blinkIntervalQueue -> CursorTask (core 0) -> OLED
