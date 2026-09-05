@@ -115,6 +115,16 @@ void ConfigStore::reset(AppConfig &config) {
   writeSchema(ConfigSchema::CurrentVersion, config);
 }
 
+bool ConfigStore::selfTest() {
+  Preferences preferences;
+  if (!preferences.begin("app-config", false)) {
+    return false;
+  }
+  uint16_t version = preferences.getUShort("cfg_version", 0);
+  preferences.end();
+  return version == 0 || findSchema(version) != nullptr;
+}
+
 bool ConfigStore::migrate(uint16_t targetVersion, AppConfig &config) {
   if (findSchema(targetVersion) == nullptr) {
     return false;

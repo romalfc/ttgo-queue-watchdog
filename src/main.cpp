@@ -14,6 +14,17 @@
 
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 SX1276 radio = new Module(LORA_CS, LORA_DIO0, LORA_RST, LORA_DIO1);
+volatile uint32_t postMask = 0;
+bool radioReady = false;
+bool oledReady = false;
+
+enum PostBit : uint32_t {
+  PostPower = 1u << 0,
+  PostNvs = 1u << 1,
+  PostOled = 1u << 2,
+  PostRadio = 1u << 3
+};
+constexpr uint32_t POST_ALL_OK = PostPower | PostNvs | PostOled | PostRadio;
 enum class ButtonPress : uint8_t {
   Single,
   Double
@@ -63,6 +74,66 @@ LogLevel currentLogLevel = LOGGER_DEFAULT_LEVEL;
 bool serialLoggingEnabled = LOGGER_SERIAL_ENABLED != 0;
 AppConfig config{};
 ConfigStore configStore;
+
+const char *logLevelName(LogLevel level);
+bool setLogLevel(const char *levelName);
+void logMessage(LogLevel level, const char *format, ...);
+
+bool postCheckPower() {
+  esp_reset_reason_t resetReason = esp_reset_reason();
+  bool healthy = ESP.getFreeHeap() > 0 && getCpuFrequencyMhz() > 0 &&
+                 resetReason != ESP_RST_BROWNOUT;
+  logMessage(healthy ? LogLevel::Info : LogLevel::Error,
+             "POST power: %s, reset_reason=%d, heap=%lu",
+             healthy ? "PASS" : "FAIL", static_cast<int>(resetReason),
+             static_cast<unsigned long>(ESP.getFreeHeap()));
+  return healthy;
+}
+
+bool postCheckNvs() {
+  bool healthy = configStore.selfTest();
+  logMessage(healthy ? LogLevel::Info : LogLevel::Error,
+             "POST NVS: %s", healthy ? "PASS" : "FAIL");
+  return healthy;
+}
+
+bool postCheckOled() {
+  if (!oledReady) {
+    logMessage(LogLevel::Error, "POST OLED: FAIL, initialization failed");
+    return false;
+  }
+  display.clearDisplay();
+  display.drawPixel(0, 0, SSD1306_WHITE);
+  display.display();
+  delay(2);
+  display.clearDisplay();
+  display.display();
+  logMessage(LogLevel::Info, "POST OLED: PASS");
+  return true;
+}
+
+bool postCheckRadio() {
+  pinMode(LORA_DIO0, INPUT);
+  int16_t status = radio.begin(LORA_FREQUENCY, 125.0, 11, 5, 0x12, 10, 8);
+  radioReady = status == RADIOLIB_ERR_NONE;
+  logMessage(radioReady ? LogLevel::Info : LogLevel::Error,
+             "POST radio: %s, code=%d", radioReady ? "PASS" : "FAIL", status);
+  return radioReady;
+}
+
+uint32_t runPost() {
+  uint32_t result = 0;
+  if (postCheckPower()) result |= PostPower;
+  if (postCheckNvs()) result |= PostNvs;
+  if (postCheckOled()) result |= PostOled;
+  if (postCheckRadio()) result |= PostRadio;
+  postMask = result;
+  logMessage(result == POST_ALL_OK ? LogLevel::Info : LogLevel::Error,
+             "POST complete: mask=0x%08lX (%s)",
+             static_cast<unsigned long>(result),
+             result == POST_ALL_OK ? "PASS" : "FAIL");
+  return result;
+}
 
 const char *logLevelName(LogLevel level);
 bool setLogLevel(const char *levelName);
@@ -301,21 +372,21 @@ void cursorTask(void *parameter) {
 
 void radioTask(void *parameter) {
   (void)parameter;
-  pinMode(LORA_DIO0, INPUT);
-
-  int16_t status = radio.begin(LORA_FREQUENCY, 125.0, 11, 5, 0x12, 10, 8);
-  if (status != RADIOLIB_ERR_NONE) {
-    logMessage(LogLevel::Error, "Radio initialization failed, code=%d", status);
+  if (!radioReady) {
+    logMessage(LogLevel::Error, "RadioTask disabled because POST radio check failed");
     vTaskDelete(nullptr);
   }
   logMessage(LogLevel::Info, "RadioTask ready: LoRa SF11, packet=%u bytes",
              static_cast<unsigned>(LORA_PACKET_SIZE));
 
   uint8_t packet[LORA_PACKET_SIZE];
-  for (size_t index = 0; index < sizeof(packet); ++index) {
+  uint32_t telemetryPostMask = postMask;
+  memcpy(packet, &telemetryPostMask, sizeof(telemetryPostMask));
+  for (size_t index = sizeof(telemetryPostMask); index < sizeof(packet); ++index) {
     packet[index] = static_cast<uint8_t>(index);
   }
 
+  int16_t status = RADIOLIB_ERR_NONE;
   bool request;
   for (;;) {
     if (xQueueReceive(radioTransmitQueue, &request, portMAX_DELAY) != pdTRUE) {
@@ -520,7 +591,7 @@ void setup() {
   pinMode(BUTTON_PIN, INPUT_PULLUP);
 
   Wire.begin(OLED_SDA, OLED_SCL);
-  display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
+  oledReady = display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
   display.clearDisplay();
   display.display();
 
@@ -542,6 +613,7 @@ void setup() {
   config = configStore.load();
   currentLogLevel = config.logLevel;
   serialLoggingEnabled = config.serialLogging;
+  runPost();
 
   xTaskCreatePinnedToCore(buttonTask, "ButtonTask", 2048, nullptr, 1, nullptr, 1);
   xTaskCreatePinnedToCore(cursorTask, "CursorTask", 2048, nullptr, 1, nullptr, 0);
