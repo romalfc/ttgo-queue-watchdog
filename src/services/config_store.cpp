@@ -1,4 +1,4 @@
-#include "config_store.h"
+#include "services/config_store.h"
 
 #include <Preferences.h>
 
@@ -23,9 +23,7 @@ constexpr SchemaDescriptor SCHEMAS[] = {
 
 const SchemaDescriptor *findSchema(uint16_t version) {
   for (const SchemaDescriptor &schema : SCHEMAS) {
-    if (schema.version == version) {
-      return &schema;
-    }
+    if (schema.version == version) return &schema;
   }
   return nullptr;
 }
@@ -47,16 +45,13 @@ bool isValidConfig(const AppConfig &config) {
 
 bool ConfigStore::writeSchema(uint16_t version, const AppConfig &config) {
   const SchemaDescriptor *schema = findSchema(version);
-  if (schema == nullptr) {
-    return false;
-  }
+  if (schema == nullptr) return false;
 
   Preferences preferences;
   preferences.begin("app-config", false);
   preferences.putUShort("cfg_version", schema->version);
   if (schema->logLevelKey != nullptr) {
-    preferences.putUChar(schema->logLevelKey,
-                         static_cast<uint8_t>(config.logLevel));
+    preferences.putUChar(schema->logLevelKey, static_cast<uint8_t>(config.logLevel));
   }
   preferences.putBool(schema->serialLoggingKey, config.serialLogging);
   preferences.putUInt(schema->watchdogTimeoutKey, config.watchdogTimeoutMs);
@@ -84,8 +79,7 @@ AppConfig ConfigStore::load() {
     config.logLevel = static_cast<LogLevel>(preferences.getUChar(
         schema->logLevelKey, static_cast<uint8_t>(config.logLevel)));
   }
-  config.serialLogging = preferences.getBool(schema->serialLoggingKey,
-                                              config.serialLogging);
+  config.serialLogging = preferences.getBool(schema->serialLoggingKey, config.serialLogging);
   config.watchdogTimeoutMs = preferences.getUInt(schema->watchdogTimeoutKey,
                                                  config.watchdogTimeoutMs);
   if (schema->dutyCycleKey != nullptr) {
@@ -95,9 +89,7 @@ AppConfig ConfigStore::load() {
   preferences.end();
 
   bool validConfig = isValidConfig(config);
-  if (!validConfig) {
-    config = defaultConfig();
-  }
+  if (!validConfig) config = defaultConfig();
   config.version = ConfigSchema::CurrentVersion;
   if (storedVersion != ConfigSchema::CurrentVersion || !validConfig) {
     writeSchema(ConfigSchema::CurrentVersion, config);
@@ -117,23 +109,16 @@ void ConfigStore::reset(AppConfig &config) {
 
 bool ConfigStore::selfTest() {
   Preferences preferences;
-  if (!preferences.begin("app-config", false)) {
-    return false;
-  }
+  if (!preferences.begin("app-config", false)) return false;
   uint16_t version = preferences.getUShort("cfg_version", 0);
   preferences.end();
   return version == 0 || findSchema(version) != nullptr;
 }
 
 bool ConfigStore::migrate(uint16_t targetVersion, AppConfig &config) {
-  if (findSchema(targetVersion) == nullptr) {
-    return false;
-  }
-
+  if (findSchema(targetVersion) == nullptr) return false;
   AppConfig current = load();
-  if (!writeSchema(targetVersion, current)) {
-    return false;
-  }
+  if (!writeSchema(targetVersion, current)) return false;
   current.version = targetVersion;
   config = current;
   return true;

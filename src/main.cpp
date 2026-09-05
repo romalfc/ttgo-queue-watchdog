@@ -1,19 +1,17 @@
 #include <Arduino.h>
-#include <Wire.h>
-#include <Adafruit_GFX.h>
-#include <Adafruit_SSD1306.h>
-#include <RadioLib.h>
 #include <esp_system.h>
-#include <stdarg.h>
 #include "config.h"
-#include "config_store.h"
+#include "services/config_store.h"
+#include "drivers/oled_driver.h"
+#include "drivers/radio_driver.h"
+#include "services/logger.h"
 
 #ifndef BUILD_HASH
 #define BUILD_HASH "unknown"
 #endif
 
-Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
-SX1276 radio = new Module(LORA_CS, LORA_DIO0, LORA_RST, LORA_DIO1);
+OledDriver display;
+RadioDriver radio;
 volatile uint32_t postMask = 0;
 bool radioReady = false;
 bool oledReady = false;
@@ -52,32 +50,27 @@ struct WatchdogIncident {
   char reason[48];
 };
 
-struct LogEntry {
-  uint32_t uptimeMs;
-  LogLevel level;
-  char message[LOG_MESSAGE_SIZE];
-};
-
 QueueHandle_t buttonEventQueue;
 QueueHandle_t blinkIntervalQueue;
 QueueHandle_t serialResultQueue;
 QueueHandle_t deadlockQueue;
 QueueHandle_t radioTransmitQueue;
 SemaphoreHandle_t displayMutex;
-SemaphoreHandle_t logMutex;
 volatile uint32_t cursorHeartbeatMs = 0;
 RTC_DATA_ATTR WatchdogIncident lastWatchdogIncident{};
-LogEntry logRing[LOG_CAPACITY]{};
-size_t logRingNext = 0;
-size_t logRingCount = 0;
-LogLevel currentLogLevel = LOGGER_DEFAULT_LEVEL;
-bool serialLoggingEnabled = LOGGER_SERIAL_ENABLED != 0;
 AppConfig config{};
 ConfigStore configStore;
+Logger logger;
 
-const char *logLevelName(LogLevel level);
-bool setLogLevel(const char *levelName);
-void logMessage(LogLevel level, const char *format, ...);
+#define logMessage(...) logger.message(__VA_ARGS__)
+
+bool setLogLevel(const char *levelName) {
+  return logger.setLevel(levelName);
+}
+
+void printVersion() {
+  logger.printVersion(BUILD_HASH, config.dutyCyclePercent);
+}
 
 bool postCheckPower() {
   esp_reset_reason_t resetReason = esp_reset_reason();
@@ -102,20 +95,17 @@ bool postCheckOled() {
     logMessage(LogLevel::Error, "POST OLED: FAIL, initialization failed");
     return false;
   }
-  display.clearDisplay();
-  display.drawPixel(0, 0, SSD1306_WHITE);
-  display.display();
+  display.clear();
+  display.drawCursor(true);
   delay(2);
-  display.clearDisplay();
-  display.display();
+  display.clear();
   logMessage(LogLevel::Info, "POST OLED: PASS");
   return true;
 }
 
 bool postCheckRadio() {
-  pinMode(LORA_DIO0, INPUT);
-  int16_t status = radio.begin(LORA_FREQUENCY, 125.0, 11, 5, 0x12, 10, 8);
-  radioReady = status == RADIOLIB_ERR_NONE;
+  int16_t status = radio.begin();
+  radioReady = RadioDriver::statusOk(status);
   logMessage(radioReady ? LogLevel::Info : LogLevel::Error,
              "POST radio: %s, code=%d", radioReady ? "PASS" : "FAIL", status);
   return radioReady;
@@ -135,12 +125,9 @@ uint32_t runPost() {
   return result;
 }
 
-const char *logLevelName(LogLevel level);
-bool setLogLevel(const char *levelName);
-
 void printConfig() {
   Serial.printf("cfg_version=%u\n", static_cast<unsigned>(config.version));
-  Serial.printf("log_level=%s\n", logLevelName(config.logLevel));
+  Serial.printf("log_level=%s\n", Logger::levelName(config.logLevel));
   Serial.printf("serial_logging=%s\n", config.serialLogging ? "on" : "off");
   Serial.printf("watchdog_timeout_ms=%lu\n",
                 static_cast<unsigned long>(config.watchdogTimeoutMs));
@@ -150,12 +137,12 @@ void printConfig() {
 
 bool setConfigValue(const char *key, const char *value) {
   if (strcmp(key, "log_level") == 0) {
-    if (!setLogLevel(value)) return false;
-    config.logLevel = currentLogLevel;
+    if (!logger.setLevel(value)) return false;
+    config.logLevel = logger.level();
   } else if (strcmp(key, "serial_logging") == 0) {
     if (strcmp(value, "on") != 0 && strcmp(value, "off") != 0) return false;
     config.serialLogging = strcmp(value, "on") == 0;
-    serialLoggingEnabled = config.serialLogging;
+    logger.setSerialEnabled(config.serialLogging);
   } else if (strcmp(key, "watchdog_timeout_ms") == 0) {
     unsigned long parsed = strtoul(value, nullptr, 10);
     if (parsed < MIN_WATCHDOG_TIMEOUT_MS || parsed > MAX_WATCHDOG_TIMEOUT_MS) return false;
@@ -173,78 +160,8 @@ bool setConfigValue(const char *key, const char *value) {
 
 void resetConfig() {
   configStore.reset(config);
-  currentLogLevel = config.logLevel;
-  serialLoggingEnabled = config.serialLogging;
-}
-
-const char *logLevelName(LogLevel level) {
-  switch (level) {
-    case LogLevel::Error: return "ERROR";
-    case LogLevel::Warn: return "WARN";
-    case LogLevel::Info: return "INFO";
-    case LogLevel::Debug: return "DEBUG";
-  }
-  return "UNKNOWN";
-}
-
-void logMessage(LogLevel level, const char *format, ...) {
-  LogEntry entry{};
-  entry.uptimeMs = millis();
-  entry.level = level;
-  va_list arguments;
-  va_start(arguments, format);
-  vsnprintf(entry.message, sizeof(entry.message), format, arguments);
-  va_end(arguments);
-
-  if (logMutex != nullptr) {
-    xSemaphoreTake(logMutex, portMAX_DELAY);
-  }
-  logRing[logRingNext] = entry;
-  logRingNext = (logRingNext + 1) % LOG_CAPACITY;
-  if (logRingCount < LOG_CAPACITY) {
-    ++logRingCount;
-  }
-  if (serialLoggingEnabled && level <= currentLogLevel) {
-    Serial.printf("[%lu ms] [%s] %s\n",
-                  static_cast<unsigned long>(entry.uptimeMs),
-                  logLevelName(level), entry.message);
-  }
-  if (logMutex != nullptr) {
-    xSemaphoreGive(logMutex);
-  }
-}
-
-void printVersion() {
-  xSemaphoreTake(logMutex, portMAX_DELAY);
-  Serial.println(F("Build information:"));
-  Serial.printf("  hash=%s\n", BUILD_HASH);
-  Serial.println(F("  platform=ESP32 TTGO LoRa32"));
-  Serial.println(F("  framework=Arduino/FreeRTOS"));
-  Serial.println(F("  radio=LoRa 868 MHz, SF11, BW125 kHz, CR5, 32 bytes"));
-  Serial.printf("  duty_cycle=%u%%\n", static_cast<unsigned>(config.dutyCyclePercent));
-  Serial.printf("  log_level=%s\n", logLevelName(currentLogLevel));
-  Serial.printf("  serial_logging=%s\n", serialLoggingEnabled ? "on" : "off");
-  Serial.printf("  ring_entries=%u/%u\n",
-                static_cast<unsigned>(logRingCount),
-                static_cast<unsigned>(LOG_CAPACITY));
-  Serial.println(F("Ring log:"));
-  size_t firstEntry = (logRingNext + LOG_CAPACITY - logRingCount) % LOG_CAPACITY;
-  for (size_t index = 0; index < logRingCount; ++index) {
-    const LogEntry &entry = logRing[(firstEntry + index) % LOG_CAPACITY];
-    Serial.printf("  [%lu ms] [%s] %s\n",
-                  static_cast<unsigned long>(entry.uptimeMs),
-                  logLevelName(entry.level), entry.message);
-  }
-  xSemaphoreGive(logMutex);
-}
-
-bool setLogLevel(const char *levelName) {
-  if (strcmp(levelName, "error") == 0) currentLogLevel = LogLevel::Error;
-  else if (strcmp(levelName, "warn") == 0) currentLogLevel = LogLevel::Warn;
-  else if (strcmp(levelName, "info") == 0) currentLogLevel = LogLevel::Info;
-  else if (strcmp(levelName, "debug") == 0) currentLogLevel = LogLevel::Debug;
-  else return false;
-  return true;
+  logger.setLevel(config.logLevel);
+  logger.setSerialEnabled(config.serialLogging);
 }
 
 void printPreviousWatchdogIncident() {
@@ -361,9 +278,7 @@ void cursorTask(void *parameter) {
 
     cursorVisible = !cursorVisible;
     xSemaphoreTake(displayMutex, portMAX_DELAY);
-    display.fillRect(122, 56, 6, 8,
-                     cursorVisible ? SSD1306_WHITE : SSD1306_BLACK);
-    display.display();
+    display.drawCursor(cursorVisible);
     xSemaphoreGive(displayMutex);
     nextCursorToggleMs = nowMs + blinkIntervalMs;
     cursorHeartbeatMs = millis();
@@ -372,7 +287,7 @@ void cursorTask(void *parameter) {
 
 void radioTask(void *parameter) {
   (void)parameter;
-  if (!radioReady) {
+  if (!radio.ready()) {
     logMessage(LogLevel::Error, "RadioTask disabled because POST radio check failed");
     vTaskDelete(nullptr);
   }
@@ -386,7 +301,7 @@ void radioTask(void *parameter) {
     packet[index] = static_cast<uint8_t>(index);
   }
 
-  int16_t status = RADIOLIB_ERR_NONE;
+  int16_t status = 0;
   bool request;
   for (;;) {
     if (xQueueReceive(radioTransmitQueue, &request, portMAX_DELAY) != pdTRUE) {
@@ -395,18 +310,18 @@ void radioTask(void *parameter) {
 
     uint32_t transmissionStartedMs = millis();
     status = radio.startTransmit(packet, sizeof(packet));
-    if (status != RADIOLIB_ERR_NONE) {
+    if (!RadioDriver::statusOk(status)) {
       logMessage(LogLevel::Error, "Radio startTransmit failed, code=%d", status);
       continue;
     }
 
-    while (digitalRead(LORA_DIO0) == LOW) {
+    while (!radio.transmissionComplete()) {
       vTaskDelay(pdMS_TO_TICKS(1));
     }
 
     status = radio.finishTransmit();
     uint32_t transmissionTimeMs = millis() - transmissionStartedMs;
-    logMessage(status == RADIOLIB_ERR_NONE ? LogLevel::Info : LogLevel::Error,
+    logMessage(RadioDriver::statusOk(status) ? LogLevel::Info : LogLevel::Error,
            "LoRa TX: %u bytes, elapsed=%lu ms, result=%d",
            static_cast<unsigned>(sizeof(packet)),
            static_cast<unsigned long>(transmissionTimeMs), status);
@@ -516,8 +431,8 @@ void processSerialCommands() {
         uint16_t targetVersion = static_cast<uint16_t>(configMinor);
         queued = configStore.migrate(targetVersion, config);
         if (queued) {
-          currentLogLevel = config.logLevel;
-          serialLoggingEnabled = config.serialLogging;
+          logger.setLevel(config.logLevel);
+          logger.setSerialEnabled(config.serialLogging);
           printConfig();
           logMessage(LogLevel::Info, "Configuration migrated to 0.%u",
                      configMinor);
@@ -541,10 +456,10 @@ void processSerialCommands() {
         }
       } else if (strcmp(command, "logserial on") == 0 ||
                  strcmp(command, "logserial off") == 0) {
-        serialLoggingEnabled = strcmp(command, "logserial on") == 0;
+        logger.setSerialEnabled(strcmp(command, "logserial on") == 0);
         queued = true;
         Serial.printf("Serial logging: %s\n",
-                      serialLoggingEnabled ? "on" : "off");
+                logger.serialEnabled() ? "on" : "off");
       } else if (strcmp(command, RADIO_COMMAND) == 0) {
         bool trigger = true;
         queued = xQueueSend(radioTransmitQueue, &trigger, 0) == pdTRUE;
@@ -590,10 +505,7 @@ void setup() {
   printPreviousWatchdogIncident();
   pinMode(BUTTON_PIN, INPUT_PULLUP);
 
-  Wire.begin(OLED_SDA, OLED_SCL);
-  oledReady = display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
-  display.clearDisplay();
-  display.display();
+  oledReady = display.begin();
 
   buttonEventQueue = xQueueCreate(8, sizeof(SerialButtonCommand));
   blinkIntervalQueue = xQueueCreate(2, sizeof(uint32_t));
@@ -601,18 +513,17 @@ void setup() {
   deadlockQueue = xQueueCreate(1, sizeof(bool));
   radioTransmitQueue = xQueueCreate(2, sizeof(bool));
   displayMutex = xSemaphoreCreateMutex();
-  logMutex = xSemaphoreCreateMutex();
   if (buttonEventQueue == nullptr || blinkIntervalQueue == nullptr ||
       serialResultQueue == nullptr || deadlockQueue == nullptr ||
-      radioTransmitQueue == nullptr || displayMutex == nullptr || logMutex == nullptr) {
+      radioTransmitQueue == nullptr || displayMutex == nullptr) {
     while (true) {
       delay(1000);
     }
   }
 
   config = configStore.load();
-  currentLogLevel = config.logLevel;
-  serialLoggingEnabled = config.serialLogging;
+  logger.setLevel(config.logLevel);
+  logger.setSerialEnabled(config.serialLogging);
   runPost();
 
   xTaskCreatePinnedToCore(buttonTask, "ButtonTask", 2048, nullptr, 1, nullptr, 1);

@@ -5,6 +5,16 @@
 Повна специфікація telemetry-протоколу: [PROTOCOL_SPEC.md](PROTOCOL_SPEC.md).
 Польовий чекліст перед використанням: [FIELD_CHECKLIST.md](FIELD_CHECKLIST.md).
 
+## Архітектура
+
+Проєкт поділено на три рівні:
+
+- **Application**: `src/main.cpp` координує setup/loop, FreeRTOS-задачі, черги та Serial-команди.
+- **Services**: `src/services/` містить `ConfigStore` для NVS і `Logger` із рівнями та кільцевим логом.
+- **Drivers**: `src/drivers/` містить `OledDriver` і `RadioDriver`, які ізолюють SSD1306, Wire, SX1276, RadioLib і GPIO.
+
+Спільні контракти та параметри знаходяться в `include/config.h`; Application не працює з апаратними бібліотеками напряму.
+
 ```text
 Кнопка -> ButtonTask (core 1) -> blinkIntervalQueue -> CursorTask (core 0) -> OLED
 Serial `radio` -> radioTransmitQueue -> RadioTask (core 0) -> SX1276
