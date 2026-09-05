@@ -29,6 +29,10 @@ Serial `radio` -> radioTransmitQueue -> RadioTask (core 0) -> SX1276
 - `version` виводить hash поточної збірки, параметри прошивки та кільцевий лог.
 - `loglevel error|warn|info|debug` змінює мінімальний рівень повідомлень у Serial Monitor.
 - `logserial on|off` вмикає або вимикає дублювання логів у Serial Monitor.
+- `config get` показує поточну конфігурацію.
+- `config set <key> <value>` змінює і зберігає параметр.
+- `config reset` повертає всі параметри до значень за замовчуванням.
+- `config migrate 0.1` або `config migrate 0.2` явно переносить конфігурацію між схемами.
 
 Serial-команди надходять у ту саму чергу подій, що обробляється `ButtonTask`.
 Після виконання команда і поточний інтервал виводяться в Serial Monitor, наприклад:
@@ -50,7 +54,7 @@ Ring log:
   [1234 ms] [INFO] System started, build=1e0bcaf84ef4
 ```
 
-Налаштування logger знаходяться на початку `src/main.cpp`:
+Налаштування проєкту знаходяться в `include/config.h`:
 
 ```cpp
 #define LOGGER_SERIAL_ENABLED 1
@@ -58,6 +62,29 @@ constexpr LogLevel LOGGER_DEFAULT_LEVEL = LogLevel::Info;
 ```
 
 Кільцевий лог зберігає останні 32 записи незалежно від Serial-виводу. Кожен запис містить uptime в мілісекундах, рівень і повідомлення. Доступні рівні: `ERROR`, `WARN`, `INFO`, `DEBUG`. У Serial Monitor виводяться лише записи не нижче поточного рівня, якщо `LOGGER_SERIAL_ENABLED` або команда `logserial on` дозволяє Serial-вивід.
+
+## Конфігурація NVS
+
+Усі схеми конфігурації описані в одному `include/config.h`. Поточна схема `0.2` має `cfg_version=2`; попередня схема `0.1` описана там же через `ConfigSchema::VersionV01`. Для додавання нової версії достатньо додати нові ключі та один крок міграції, без нового файлу. Параметри та допустимі межі:
+
+| Параметр | Значення |
+| --- | --- |
+| `log_level` | `error`, `warn`, `info`, `debug` |
+| `serial_logging` | `on`, `off` |
+| `watchdog_timeout_ms` | від 1000 до 60000 мс |
+| `duty_cycle_percent` | від 1 до 100% |
+
+У NVS ці параметри зберігаються під короткими ключами `wd_timeout_ms` і `duty_pct`, оскільки NVS обмежує довжину ключа 15 символами.
+
+Приклад:
+
+```text
+config set watchdog_timeout_ms 10000
+config set log_level debug
+config get
+```
+
+Конфігурація зберігається в ESP32 NVS. Команда `config migrate 0.1` записує формат v0.1 (`serial_log`, `watchdog_ms`), а `config migrate 0.2` записує формат v0.2. Під час наступного запуску формат v0.1 автоматично мігрує до v0.2: ключі `serial_log` і `watchdog_ms` переносяться в `serial_logging` і `watchdog_timeout_ms`.
 
 Команда `deadlock` запускає `DeadlockTask`, яка захоплює `displayMutex` і навмисно не звільняє його. Після цього `CursorTask` та головний цикл блокуються на цьому mutex. Для відновлення роботи потрібен reset плати.
 

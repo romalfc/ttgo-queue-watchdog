@@ -5,43 +5,12 @@
 #include <RadioLib.h>
 #include <esp_system.h>
 #include <stdarg.h>
+#include "config.h"
+#include "config_store.h"
 
 #ifndef BUILD_HASH
 #define BUILD_HASH "unknown"
 #endif
-
-#define SCREEN_WIDTH 128
-#define SCREEN_HEIGHT 64
-#define OLED_SDA 21
-#define OLED_SCL 22
-#define OLED_RESET (-1)
-#define BUTTON_PIN 0
-#define LORA_CS 18
-#define LORA_DIO0 26
-#define LORA_DIO1 33
-#define LORA_RST 23
-#define LORA_FREQUENCY 868.0
-#ifndef LOGGER_SERIAL_ENABLED
-#define LOGGER_SERIAL_ENABLED 1
-#endif
-
-constexpr char SINGLE_BUTTON_COMMAND[] = "single-btn";
-constexpr char DOUBLE_BUTTON_COMMAND[] = "double-btn";
-constexpr char DEADLOCK_COMMAND[] = "deadlock";
-constexpr char RADIO_COMMAND[] = "radio";
-constexpr uint32_t DOUBLE_CLICK_THRESHOLD_MS = 350;
-constexpr uint32_t WATCHDOG_TIMEOUT_MS = 5000;
-constexpr uint32_t WATCHDOG_INCIDENT_MAGIC = 0x57444331;
-constexpr size_t LORA_PACKET_SIZE = 32;
-constexpr uint8_t LORA_DUTY_CYCLE_PERCENT = 1;
-constexpr size_t LOG_CAPACITY = 32;
-constexpr size_t LOG_MESSAGE_SIZE = 96;
-
-constexpr uint32_t BLINK_INTERVALS_MS[] = {100, 500, 1000, 2000};
-constexpr size_t BLINK_INTERVAL_COUNT = sizeof(BLINK_INTERVALS_MS) /
-                                         sizeof(BLINK_INTERVALS_MS[0]);
-constexpr TickType_t BUTTON_DEBOUNCE = pdMS_TO_TICKS(40);
-constexpr TickType_t DOUBLE_CLICK_WINDOW = pdMS_TO_TICKS(350);
 
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 SX1276 radio = new Module(LORA_CS, LORA_DIO0, LORA_RST, LORA_DIO1);
@@ -72,15 +41,6 @@ struct WatchdogIncident {
   char reason[48];
 };
 
-enum class LogLevel : uint8_t {
-  Error = 0,
-  Warn,
-  Info,
-  Debug
-};
-
-constexpr LogLevel LOGGER_DEFAULT_LEVEL = LogLevel::Info;
-
 struct LogEntry {
   uint32_t uptimeMs;
   LogLevel level;
@@ -101,6 +61,50 @@ size_t logRingNext = 0;
 size_t logRingCount = 0;
 LogLevel currentLogLevel = LOGGER_DEFAULT_LEVEL;
 bool serialLoggingEnabled = LOGGER_SERIAL_ENABLED != 0;
+AppConfig config{};
+ConfigStore configStore;
+
+const char *logLevelName(LogLevel level);
+bool setLogLevel(const char *levelName);
+
+void printConfig() {
+  Serial.printf("cfg_version=%u\n", static_cast<unsigned>(config.version));
+  Serial.printf("log_level=%s\n", logLevelName(config.logLevel));
+  Serial.printf("serial_logging=%s\n", config.serialLogging ? "on" : "off");
+  Serial.printf("watchdog_timeout_ms=%lu\n",
+                static_cast<unsigned long>(config.watchdogTimeoutMs));
+  Serial.printf("duty_cycle_percent=%u\n",
+                static_cast<unsigned>(config.dutyCyclePercent));
+}
+
+bool setConfigValue(const char *key, const char *value) {
+  if (strcmp(key, "log_level") == 0) {
+    if (!setLogLevel(value)) return false;
+    config.logLevel = currentLogLevel;
+  } else if (strcmp(key, "serial_logging") == 0) {
+    if (strcmp(value, "on") != 0 && strcmp(value, "off") != 0) return false;
+    config.serialLogging = strcmp(value, "on") == 0;
+    serialLoggingEnabled = config.serialLogging;
+  } else if (strcmp(key, "watchdog_timeout_ms") == 0) {
+    unsigned long parsed = strtoul(value, nullptr, 10);
+    if (parsed < MIN_WATCHDOG_TIMEOUT_MS || parsed > MAX_WATCHDOG_TIMEOUT_MS) return false;
+    config.watchdogTimeoutMs = parsed;
+  } else if (strcmp(key, "duty_cycle_percent") == 0) {
+    unsigned long parsed = strtoul(value, nullptr, 10);
+    if (parsed < 1 || parsed > 100) return false;
+    config.dutyCyclePercent = static_cast<uint8_t>(parsed);
+  } else {
+    return false;
+  }
+  configStore.save(config);
+  return true;
+}
+
+void resetConfig() {
+  configStore.reset(config);
+  currentLogLevel = config.logLevel;
+  serialLoggingEnabled = config.serialLogging;
+}
 
 const char *logLevelName(LogLevel level) {
   switch (level) {
@@ -146,7 +150,7 @@ void printVersion() {
   Serial.println(F("  platform=ESP32 TTGO LoRa32"));
   Serial.println(F("  framework=Arduino/FreeRTOS"));
   Serial.println(F("  radio=LoRa 868 MHz, SF11, BW125 kHz, CR5, 32 bytes"));
-  Serial.printf("  duty_cycle=%u%%\n", static_cast<unsigned>(LORA_DUTY_CYCLE_PERCENT));
+  Serial.printf("  duty_cycle=%u%%\n", static_cast<unsigned>(config.dutyCyclePercent));
   Serial.printf("  log_level=%s\n", logLevelName(currentLogLevel));
   Serial.printf("  serial_logging=%s\n", serialLoggingEnabled ? "on" : "off");
   Serial.printf("  ring_entries=%u/%u\n",
@@ -336,12 +340,12 @@ void radioTask(void *parameter) {
            static_cast<unsigned>(sizeof(packet)),
            static_cast<unsigned long>(transmissionTimeMs), status);
 
-    uint32_t quietTimeMs = transmissionTimeMs *
-                           (100 - LORA_DUTY_CYCLE_PERCENT) /
-                           LORA_DUTY_CYCLE_PERCENT;
+        uint32_t quietTimeMs = transmissionTimeMs *
+                (100 - config.dutyCyclePercent) /
+                config.dutyCyclePercent;
     if (quietTimeMs > 0) {
-      logMessage(LogLevel::Debug, "Duty cycle %u%%, waiting %lu ms",
-             static_cast<unsigned>(LORA_DUTY_CYCLE_PERCENT),
+          logMessage(LogLevel::Debug, "Duty cycle %u%%, waiting %lu ms",
+            static_cast<unsigned>(config.dutyCyclePercent),
              static_cast<unsigned long>(quietTimeMs));
       vTaskDelay(pdMS_TO_TICKS(quietTimeMs));
     }
@@ -356,7 +360,7 @@ void watchdogTask(void *parameter) {
     uint32_t nowMs = millis();
     uint32_t lastHeartbeatMs = cursorHeartbeatMs;
 
-    if (nowMs - lastHeartbeatMs <= WATCHDOG_TIMEOUT_MS) {
+    if (nowMs - lastHeartbeatMs <= config.watchdogTimeoutMs) {
       continue;
     }
 
@@ -398,7 +402,7 @@ void deadlockTask(void *parameter) {
 }
 
 void processSerialCommands() {
-  static char command[24];
+  static char command[64];
   static size_t commandLength = 0;
 
   while (Serial.available() > 0) {
@@ -410,6 +414,10 @@ void processSerialCommands() {
     if (character == '\n') {
       command[commandLength] = '\0';
       unsigned long intervalMs = 0;
+      unsigned int configMajor = 0;
+      unsigned int configMinor = 0;
+      char configKey[32] = {};
+      char configValue[32] = {};
       bool queued = false;
       SerialButtonCommand event{};
       strncpy(event.text, command, sizeof(event.text) - 1);
@@ -423,6 +431,36 @@ void processSerialCommands() {
       } else if (strcmp(command, "version") == 0) {
         printVersion();
         queued = true;
+      } else if (strcmp(command, "config get") == 0) {
+        printConfig();
+        queued = true;
+      } else if (strcmp(command, "config reset") == 0) {
+        resetConfig();
+        printConfig();
+        logMessage(LogLevel::Info, "Configuration reset to defaults");
+        queued = true;
+      } else if (sscanf(command, "config migrate %u.%u", &configMajor,
+                        &configMinor) == 2 && configMajor == 0 &&
+                 configMinor > 0) {
+        uint16_t targetVersion = static_cast<uint16_t>(configMinor);
+        queued = configStore.migrate(targetVersion, config);
+        if (queued) {
+          currentLogLevel = config.logLevel;
+          serialLoggingEnabled = config.serialLogging;
+          printConfig();
+          logMessage(LogLevel::Info, "Configuration migrated to 0.%u",
+                     configMinor);
+        }
+      } else if (sscanf(command, "config set %31s %31s", configKey,
+                        configValue) == 2) {
+        queued = setConfigValue(configKey, configValue);
+        if (queued) {
+          Serial.printf("Config updated: %s=%s\n", configKey, configValue);
+          logMessage(LogLevel::Info, "Configuration changed: %s=%s",
+                     configKey, configValue);
+        } else {
+          Serial.println(F("Invalid config key or value"));
+        }
       } else if (strncmp(command, "loglevel ", 9) == 0) {
         queued = setLogLevel(command + 9);
         if (queued) {
@@ -500,6 +538,10 @@ void setup() {
       delay(1000);
     }
   }
+
+  config = configStore.load();
+  currentLogLevel = config.logLevel;
+  serialLoggingEnabled = config.serialLogging;
 
   xTaskCreatePinnedToCore(buttonTask, "ButtonTask", 2048, nullptr, 1, nullptr, 1);
   xTaskCreatePinnedToCore(cursorTask, "CursorTask", 2048, nullptr, 1, nullptr, 0);
